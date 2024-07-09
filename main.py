@@ -3,6 +3,8 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+
+# avtorizatsiya-start
 fake_users_db = {
     "johndoe": {
         "user_id": 1,
@@ -93,3 +95,4 @@ async def read_users_me(
         current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     return current_user
+# avtorizatsiya-end
