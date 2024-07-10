@@ -1,8 +1,7 @@
 from typing import List, Annotated
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException, status
-
+from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
@@ -28,11 +27,11 @@ fake_users_db = {
     },
 }
 
-# fake databse
+# fake database
 fake_messages_db = []
 
 
-# SChemas
+# Schemas
 class User(BaseModel):
     client_id: int
     username: str
@@ -118,43 +117,58 @@ async def read_users_me(
     return current_user
 
 
-# @app.post("/messages/", response_model=Message)
-# def create_message(
-#         message: MessageCreate,
-#         current_user: Annotated[User, Depends(get_current_active_user)]
-# ):
-#     db_message = {
-#         "id": len(fake_messages_db) + 1,
-#         "sender_id": current_user.user_id,
-#         "receiver_id": message.receiver_id,
-#         "content": message.content,
-#         "timestamp": datetime.utcnow()
-#     }
-#     fake_messages_db.append(db_message)
-#     return db_message
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[dict] = []
 
-@app.post("/messages/", response_model=Message)
-def create_message(
-        message: MessageCreate,
-        current_user: Annotated[User, Depends(get_current_active_user)]
-):
-    receiver = next((user for user in fake_users_db.values() if user['client_id'] == message.receiver_id), None)
-    if receiver is None:
-        raise HTTPException(status_code=400, detail="Receiver not found")
+    async def connect(self, websocket: WebSocket, client_id: int):
+        await websocket.accept()
+        self.active_connections.append({"websocket": websocket, "client_id": client_id})
 
-    db_message = {
-        "id": len(fake_messages_db) + 1,
-        "sender_id": current_user.client_id,
-        "receiver_id": message.receiver_id,
-        "content": message.content,
-        "timestamp": datetime.utcnow()
-    }
-    fake_messages_db.append(db_message)
-    return db_message
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections = [conn for conn in self.active_connections if conn["websocket"] != websocket]
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection["websocket"].send_text(message)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: int):
+    await manager.connect(websocket, client_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message_data = data.split(':', 1)
+            if len(message_data) == 2:
+                receiver_id, content = int(message_data[0]), message_data[1]
+                receiver = next((user for user in fake_users_db.values() if user['client_id'] == receiver_id), None)
+                if receiver:
+                    db_message = {
+                        "id": len(fake_messages_db) + 1,
+                        "sender_id": client_id,
+                        "receiver_id": receiver_id,
+                        "content": content,
+                        "timestamp": datetime.utcnow()
+                    }
+                    fake_messages_db.append(db_message)
+                    await manager.broadcast(f"User {client_id} to User {receiver_id}: {content}")
+                else:
+                    await websocket.send_text("Receiver not found")
+            else:
+                await websocket.send_text("Invalid message format. Use 'receiver_id:content'")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 @app.get("/messages/{client_id}", response_model=List[Message])
-def read_messages(
+async def read_messages(
         client_id: int,
         current_user: Annotated[User, Depends(get_current_active_user)]
 ):
