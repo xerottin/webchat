@@ -49,6 +49,7 @@ class TokenData(BaseModel):
 
 
 class User(BaseModel):
+    client_id: int
     username: str
     email: str | None = None
     full_name: str | None = None
@@ -206,47 +207,31 @@ manager = ConnectionManager()
 
 
 @app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: int, token: str = Depends(oauth2_scheme)):
-    user = await get_current_user(token)
-    if user.client_id != client_id:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    await manager.connect(websocket, client_id)
+async def websocket_endpoint(websocket: WebSocket, client_id: int):
     try:
-        while True:
-            data = await websocket.receive_text()
-            message_data = data.split(':', 1)
-            if len(message_data) == 2:
-                receiver_id, content = int(message_data[0]), message_data[1]
-                receiver = next((user for user in fake_users_db.values() if user['client_id'] == receiver_id), None)
-                if receiver:
-                    db_message = {
-                        "id": len(fake_messages_db) + 1,
-                        "sender_id": client_id,
-                        "receiver_id": receiver_id,
-                        "content": content,
-                        "timestamp": datetime.utcnow()
-                    }
-                    fake_messages_db.append(db_message)
-                    await manager.broadcast(f"User {client_id} to User {receiver_id}: {content}")
+        await manager.connect(websocket, client_id)
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message_data = data.split(':', 1)
+                if len(message_data) == 2:
+                    receiver_id, content = int(message_data[0]), message_data[1]
+                    receiver = next((user for user in fake_users_db.values() if user['client_id'] == receiver_id), None)
+                    if receiver:
+                        db_message = {
+                            "id": len(fake_messages_db) + 1,
+                            "sender_id": client_id,
+                            "receiver_id": receiver_id,
+                            "content": content,
+                            "timestamp": datetime.utcnow()
+                        }
+                        fake_messages_db.append(db_message)
+                        await manager.broadcast(f"User {client_id} to User {receiver_id}: {content}")
+                    else:
+                        await websocket.send_text("Receiver not found")
                 else:
-                    await websocket.send_text("Receiver not found")
-            else:
-                await websocket.send_text("Invalid message format. Use 'receiver_id:content'")
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-
-
-@app.get("/messages/{client_id}", response_model=List[Message])
-async def read_messages(
-        client_id: int,
-        current_user: Annotated[User, Depends(get_current_active_user)]
-):
-    if current_user.client_id != client_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view these messages")
-    user_messages = [
-        message for message in fake_messages_db
-        if message['sender_id'] == client_id or message['receiver_id'] == client_id
-    ]
-    return user_messages
+                    await websocket.send_text("Invalid message format. Use 'receiver_id:content'")
+        except WebSocketDisconnect:
+            manager.disconnect(websocket)
+    except HTTPException as e:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
