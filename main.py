@@ -1,80 +1,56 @@
+from contextlib import asynccontextmanager
 from typing import List, Annotated
 from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 import jwt
 from jwt.exceptions import InvalidTokenError
+from databases import Database
+from sqlalchemy import create_engine, MetaData
 
-app = FastAPI()
+from models import users, messages
+from schemas import UserInDB, User, TokenData, Token
+
+DATABASE_URL = "postgresql://postgres:1111@localhost:5432/webchat"
+
+database = Database(DATABASE_URL)
+metadata = MetaData()
+
+engine = create_engine(DATABASE_URL)
+metadata.create_all(engine)
+
+
+def fake_answer_to_everything_ml_model(x: float):
+    return x * 42
+
+
+ml_models = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the ML model
+    ml_models["answer_to_everything"] = fake_answer_to_everything_ml_model
+    await database.connect()  # Connect to the database
+    yield
+    # Clean up the ML models and release the resources
+    ml_models.clear()
+    await database.disconnect()  # Disconnect from the database
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/predict")
+async def predict(x: float):
+    result = ml_models["answer_to_everything"](x)
+    return {"result": result}
+
 
 SECRET_KEY = "6f8992ef1bff58a2927017951eaa6ee97202849bc7c0cd995f9bc84e484a53b7"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-# Fake users database
-fake_users_db = {
-    "johndoe": {
-        "client_id": 1,
-        "username": "johndoe",
-        "full_name": "John Doe",
-        "email": "johndoe@example.com",
-        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # secret
-        "disabled": False,
-    },
-    "alice": {
-        "client_id": 2,
-        "username": "alice",
-        "full_name": "Alice Wonderson",
-        "email": "alice@example.com",
-        "hashed_password": "$2b$12$KIXVw5HLV8OfpQOwzv4ADe2OhQOedQEVt.QV7KHHR9h9J/UdH9JBi",
-        # Hashed password for "password"
-        "disabled": False,
-    },
-}
-
-# Fake messages database
-fake_messages_db = []
-
-
-# Schemas
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class TokenData(BaseModel):
-    username: str | None = None
-
-
-class User(BaseModel):
-    client_id: int
-    username: str
-    email: str | None = None
-    full_name: str | None = None
-    disabled: bool | None = None
-
-
-class UserInDB(User):
-    hashed_password: str
-
-
-class MessageCreate(BaseModel):
-    receiver_id: int
-    content: str
-
-
-class Message(BaseModel):
-    id: int
-    sender_id: int
-    receiver_id: int
-    content: str
-    timestamp: datetime
-
-    class Config:
-        orm_mode = True
-
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -89,18 +65,30 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
+async def get_user(username: str) -> UserInDB | None:
+    query = users.select().where(users.c.username == username)
+    user = await database.fetch_one(query)
+    if user:
+        return UserInDB(**dict(user))
 
 
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
+async def create_user(user: UserInDB):
+    query = users.insert().values(
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        hashed_password=user.hashed_password,
+        disabled=user.disabled
+    )
+    await database.execute(query)
+
+
+async def authenticate_user(username: str, password: str) -> UserInDB | None:
+    user = await get_user(username)
     if not user:
-        return False
+        return None
     if not verify_password(password, user.hashed_password):
-        return False
+        return None
     return user
 
 
@@ -129,7 +117,7 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
         token_data = TokenData(username=username)
     except InvalidTokenError:
         raise credentials_exception
-    user = get_user(fake_users_db, username=token_data.username)
+    user = await get_user(token_data.username)
     if user is None:
         raise credentials_exception
     return user
@@ -145,16 +133,15 @@ async def get_current_active_user(
 
 @app.post("/register", response_model=User)
 async def register(user: UserInDB):
-    if user.username in fake_users_db:
+    existing_user = await get_user(user.username)
+    if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already registered",
         )
     hashed_password = get_password_hash(user.hashed_password)
-    user_data = user.model_dump()
-    user_data["hashed_password"] = hashed_password
-    user_data["token"] = ""
-    fake_users_db[user.username] = user_data
+    user.hashed_password = hashed_password
+    await create_user(user)
     return user
 
 
@@ -162,7 +149,7 @@ async def register(user: UserInDB):
 async def login_for_access_token(
         form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
 ) -> Token:
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+    user = await authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -216,16 +203,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
                 message_data = data.split(':', 1)
                 if len(message_data) == 2:
                     receiver_id, content = int(message_data[0]), message_data[1]
-                    receiver = next((user for user in fake_users_db.values() if user['client_id'] == receiver_id), None)
+                    receiver = await get_user_by_client_id(receiver_id)
                     if receiver:
-                        db_message = {
-                            "id": len(fake_messages_db) + 1,
-                            "sender_id": client_id,
-                            "receiver_id": receiver_id,
-                            "content": content,
-                            "timestamp": datetime.utcnow()
-                        }
-                        fake_messages_db.append(db_message)
+                        query = messages.insert().values(
+                            sender_id=client_id,
+                            receiver_id=receiver_id,
+                            content=content,
+                            timestamp=datetime.utcnow()
+                        )
+                        await database.execute(query)
                         await manager.broadcast(f"User {client_id} to User {receiver_id}: {content}")
                     else:
                         await websocket.send_text("Receiver not found")
@@ -233,5 +219,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
                     await websocket.send_text("Invalid message format. Use 'receiver_id:content'")
         except WebSocketDisconnect:
             manager.disconnect(websocket)
-    except HTTPException as e:
+    except HTTPException as _:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+
+
+async def get_user_by_client_id(client_id: int) -> UserInDB | None:
+    query = users.select().where(users.c.client_id == client_id)
+    user = await database.fetch_one(query)
+    if user:
+        return UserInDB(**dict(user))
