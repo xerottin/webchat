@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from jwt.exceptions import InvalidTokenError
 from databases import Database
+from pydantic.deprecated.copy_internals import Model
 from sqlalchemy import create_engine, MetaData
 
 from models import users, messages
@@ -28,15 +29,24 @@ def fake_answer_to_everything_ml_model(x: float):
 ml_models = {}
 
 
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Model.metadata.create_all)
+
+
+async def delete_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Model.metadata.drop_all)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load the ML model
-    ml_models["answer_to_everything"] = fake_answer_to_everything_ml_model
-    await database.connect()  # Connect to the database
+    await delete_tables()
+    print('base clean')
+    await create_tables()
+    print('base ready')
     yield
-    # Clean up the ML models and release the resources
-    ml_models.clear()
-    await database.disconnect()  # Disconnect from the database
+    print('turn off')
 
 
 app = FastAPI(lifespan=lifespan)
